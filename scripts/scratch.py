@@ -35,18 +35,22 @@ class Worker(object):
                     np.random.normal(0.0, 0.5, size=(2,)),
                 )
             )
-            self.local_buffer = self.local_buffer[-self.size:]
+            self.local_buffer = self.local_buffer[-self.size :]
 
             if i % 100 == 0:
                 print(
+                    f"worker: {comm.Get_rank()}/{comm.Get_size()}, "
                     f"iteration: {i}, t:{time.time() - start_time}, "
                     f"data length: {len(self.local_buffer)}"
                 )
 
                 # Check if previous send is completed
-                if not MPI.Request.Testall([self.req]):
+                if not MPI.Request.Test(self.req):
                     # If nto wait for completion
-                    print("previous send was not completed")
+                    print(
+                        f"worker: {comm.Get_rank()}/{comm.Get_size()}, "
+                        f"previous send was not completed"
+                    )
                     self.req.wait()
 
                 self.req = self.communicator.isend(self.local_buffer, dest=0, tag=11)
@@ -60,18 +64,28 @@ class Learner(object):
 
         # Create persistant receive communication
         # self.req = self.communicator.Recv_init(source=1, tag=11)
-        self.req = MPI.Request()
 
     def learn(self):
         for i in range(1000):
             if i % 10 == 0:
                 print(
-                    f"training iteration: {i}, t:{time.time() - start_time}, "
+                    f"learner: training iteration: {i}, t:{time.time() - start_time}, "
                     f"data length: {len(self.replay_buffer)}"
                 )
-                self.req = self.communicator.irecv(source=1, tag=11)
-                self.replay_buffer.extend(self.req.wait())
-                self.replay_buffer = self.replay_buffer[-self.size:]
+                # self.req = self.communicator.irecv(source=1, tag=11)
+                reqs = [
+                    self.communicator.irecv(source=w, tag=11)
+                    for w in range(1, self.communicator.Get_size())
+                ]
+
+                data = MPI.Request.waitall(reqs)
+
+                print(
+                    f"learner: received data type: {type(data)}, len: {len(data)}, "
+                    # f"sample: {data}"
+                )
+                self.replay_buffer.append(data)
+                self.replay_buffer = self.replay_buffer[-self.size :]
 
             time.sleep(1)
 
