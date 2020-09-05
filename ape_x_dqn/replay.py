@@ -2,7 +2,10 @@ from collections import namedtuple
 import numpy as np
 
 
-N_Step_Transition = namedtuple('N_Step_Transition', ['S_t', 'A_t', 'R_ttpB', 'Gamma_ttpB', 'qS_t', 'S_tpn', 'qS_tpn', 'key'])
+N_Step_Transition = namedtuple(
+    "N_Step_Transition",
+    ["S_t", "A_t", "R_ttpB", "Gamma_ttpB", "qS_t", "S_tpn", "qS_tpn", "key"],
+)
 
 
 class ReplayMemory(object):
@@ -11,7 +14,7 @@ class ReplayMemory(object):
         self.memory = list()
         self.mem_idx = 0
         self.counter = 0
-        self.alpha = params['priority_exponent']
+        self.alpha = params["priority_exponent"]
         self.priorities = dict()
         self.sample_probabilities = dict()
 
@@ -21,9 +24,9 @@ class ReplayMemory(object):
         :return:
         """
         priorities = self.priorities
-        prob = [p**self.alpha/ sum(priorities.values())  for p in priorities.values()]
+        prob = [p ** self.alpha / sum(priorities.values()) for p in priorities.values()]
         prob /= sum(prob)
-        self.sample_probabilities.update({k:v for k in list(priorities) for v in prob})
+        self.sample_probabilities.update({k: v for k in list(priorities) for v in prob})
         # Let the probabilities sum to 1
         sum_of_prob = sum(self.sample_probabilities.values())
         for k in self.sample_probabilities.keys():
@@ -49,11 +52,27 @@ class ReplayMemory(object):
         :return: A list of N_Step_Transition objects
         """
         mem = N_Step_Transition(*zip(*self.memory))
-        sampled_keys = [np.random.choice(list(self.priorities.keys()), p=list(self.sample_probabilities.values()))
-                        for _ in range(sample_size) ]
-        batch_xp = [N_Step_Transition(S, A, R, G, qt, Sn, qn, key) for k in sampled_keys
-                    for S, A, R, G, qt, Sn, qn, key in zip(mem.S_t, mem.A_t, mem.R_ttpB, mem.Gamma_ttpB,
-                                                           mem.qS_t, mem.S_tpn, mem.qS_tpn, mem.key) if key == k]
+        sampled_keys = [
+            np.random.choice(
+                list(self.priorities.keys()), p=list(self.sample_probabilities.values())
+            )
+            for _ in range(sample_size)
+        ]
+        batch_xp = [
+            N_Step_Transition(S, A, R, G, qt, Sn, qn, key)
+            for k in sampled_keys
+            for S, A, R, G, qt, Sn, qn, key in zip(
+                mem.S_t,
+                mem.A_t,
+                mem.R_ttpB,
+                mem.Gamma_ttpB,
+                mem.qS_t,
+                mem.S_tpn,
+                mem.qS_tpn,
+                mem.key,
+            )
+            if key == k
+        ]
         return batch_xp
 
     def add(self, priorities, xp_batch):
@@ -77,8 +96,7 @@ class ReplayMemory(object):
         if self.size() > self.soft_capacity:
             num_excess_data = self.size() - self.soft_capacity
             # FIFO
-            del self.memory[: num_excess_data]
+            del self.memory[:num_excess_data]
 
     def size(self):
         return len(self.memory)
-
