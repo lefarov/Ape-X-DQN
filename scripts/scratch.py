@@ -1,17 +1,51 @@
 # %% Imports
-
 import time
 import torch
 import torch.nn as nn
+import torch.functional as F
 import numpy as np
 
 from mpi4py import MPI
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 
-# %% Definitions
 
+# %% Helper functions
+
+
+def model_state_bsize(model_state):
+    return sum([v.element_size() * v.nelement() for v in model_state.values()])
+
+
+def model_state_to_ndarray(model_state):
+    return torch.cat([v.flatten() for v in model_state.values()]).numpy()
+
+
+def ndarray_to_model_state(model_array, model_state):
+    loaded_state = OrderedDict()
+
+    idx = 0
+    for key, param in model_state.items():
+        loaded_state[key] = torch.from_numpy(
+            model_array[idx : idx + param.nelement()]
+        ).view(param.size())
+        idx += param.nelement()
+
+    return loaded_state
+
+
+def states_equal(state1, state2):
+    equal = True
+    for (k1, t1), (k2, t2) in zip(state1.items(), state2.items()):
+        equal = equal and torch.equal(t1, t2)
+        equal = equal and k1 == k2
+
+    return equal
+
+
+# %% Network
 start_time = time.time()
 Transition = namedtuple("Transition", ["S", "A", "R", "Gamma", "Q"])
+
 
 class Net(nn.Module):
     def __init__(self):
@@ -32,6 +66,8 @@ class Net(nn.Module):
         x = self.fc3(x)
         return x
 
+
+# %%
 class Worker(object):
     def __init__(self, mpi_comm, buffer_size, buffer_state, policy_state, n_steps=100):
         self.comm = mpi_comm
