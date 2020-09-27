@@ -10,10 +10,12 @@ from collections import namedtuple, OrderedDict
 
 
 # %% Helper functions
-
-
 def model_state_bsize(model_state):
     return sum([v.element_size() * v.nelement() for v in model_state.values()])
+
+
+def model_state_nelements(model_state):
+    return sum([v.nelement() for v in model_state.values()])
 
 
 def model_state_to_ndarray(model_state):
@@ -198,43 +200,67 @@ comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
 
-_POLICY_BCST_STATE = dict()
-_BUFFER_GTHR_STATE = list()
+net = Net()
+policy_window = MPI.Win.Allocate(model_state_bsize(net.state_dict()), comm=comm)
 
-temp_policy = torch.rand((256, 256))
-policy_window = MPI.Win.Allocate(
-    temp_policy.element_size() * temp_policy.nelement(), comm=comm
-)
+# Assign zeros to the params of shared network
+zero_state = net.state_dict()
+for key, value in zero_state.items():
+    zero_state[key] = torch.zeros_like(value)
+
+net.load_state_dict(zero_state)
 
 if rank != 0:
-    # policy = torch.ones_like(temp_policy).numpy().flatten()
-    policy = np.ones(temp_policy.nelement(), dtype=np.float32)
-    win_array = np.frombuffer(policy_window, dtype=np.float32)
-    # win_array[0] = 7.
-    print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, initial policy {policy}")
+    # Create local copy of the network and the weights buffer
+    net_local = Net()
+    state_array = np.zeros(
+        model_state_nelements(net_local.state_dict()), dtype=np.float32
+    )
+
+    # Wait for 2 seconds
     time.sleep(2)
+
+    # Read model state from the Learner's window
     policy_window.Lock(rank=0)
-    # window.Flush(rank=0)
-    policy_window.Get([policy, 2], target_rank=0)
-    # policy[:2] = win_array[:2]
+    policy_window.Get(state_array, target_rank=0)
     policy_window.Unlock(rank=0)
-    print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, loaded policy {policy}")
+
+    # Verify the correct weights
+    loaded_state = ndarray_to_model_state(state_array, net_local.state_dict())
+    print(
+        f"worker: {comm.Get_rank()}/{comm.Get_size()}, "
+        f"weights are identical: {states_equal(net.state_dict(), loaded_state)}"
+    )
 
     # worker = Worker(comm, 100, _BUFFER_GTHR_STATE, _POLICY_BCST_STATE)
     # worker.run()
 
 if rank == 0:
-    policy = torch.ones_like(temp_policy).numpy().flatten() * 5.0
-    win_array = np.frombuffer(policy_window, dtype=np.float32)
-    print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, initial policy {policy}")
+    # Write global model state to the Learner window
     policy_window.Lock(rank=0)
-    print(win_array)
-    policy_window.Put(policy, target_rank=0)
-    # win_array[:2] = policy[:2]
-    # window.Flush(rank=1)
-    # window.Sync()
-    print(win_array)
+    policy_window.Put(model_state_to_ndarray(net.state_dict()), target_rank=0)
     policy_window.Unlock(rank=0)
 
     # learner = Learner(comm, 10000, _BUFFER_GTHR_STATE, _POLICY_BCST_STATE)
     # learner.learn()
+
+
+# %%
+# policy = torch.ones_like(temp_policy).numpy().flatten()
+# policy = np.ones(temp_policy.nelement(), dtype=np.float32)
+# win_array = np.frombuffer(policy_window, dtype=np.float32)
+# win_array[0] = 7.
+# print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, initial policy {policy}")
+# policy[:2] = win_array[:2]
+# print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, loaded policy {policy}")
+# window.Flush(rank=0)
+
+# _POLICY_BCST_STATE = dict()
+# _BUFFER_GTHR_STATE = list()
+
+# policy = torch.ones_like(temp_policy).numpy().flatten() * 5.0
+# win_array = np.frombuffer(policy_window, dtype=np.float32)
+# print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, initial policy {policy}")
+# win_array[:2] = policy[:2]
+# window.Flush(rank=1)
+# window.Sync()
