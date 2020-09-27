@@ -1,23 +1,39 @@
-# %%
-# import os
-# import json
+# %% Imports
+
 import time
+import torch
+import torch.nn as nn
 import numpy as np
 
 from mpi4py import MPI
 from collections import namedtuple
 
-# %%
-start_time = time.time()
+# %% Definitions
 
-# %%
+start_time = time.time()
 Transition = namedtuple("Transition", ["S", "A", "R", "Gamma", "Q"])
 
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
 class Worker(object):
-    def __init__(
-        self, mpi_comm, buffer_size, buffer_state, policy_state, n_steps=100
-    ):
+    def __init__(self, mpi_comm, buffer_size, buffer_state, policy_state, n_steps=100):
         self.comm = mpi_comm
         self.size = buffer_size
         self.buffer = []
@@ -84,9 +100,7 @@ class Worker(object):
 
 
 class Learner(object):
-    def __init__(
-        self, mpi_comm, buffer_size, buffer_state, policy_state, n_steps=10
-    ):
+    def __init__(self, mpi_comm, buffer_size, buffer_state, policy_state, n_steps=10):
         self.comm = mpi_comm
         self.size = buffer_size
         self.buffer = []
@@ -143,53 +157,48 @@ class Learner(object):
             self.step_i += 1
 
 
-# %%
+# %% Main
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
 
-# %%
-# rma_window = MPI.Win.Create()
-
 _POLICY_BCST_STATE = dict()
 _BUFFER_GTHR_STATE = list()
 
+temp_policy = torch.rand((256, 256))
+policy_window = MPI.Win.Allocate(
+    temp_policy.element_size() * temp_policy.nelement(), comm=comm
+)
+
 if rank != 0:
-    worker = Worker(comm, 100, _BUFFER_GTHR_STATE, _POLICY_BCST_STATE)
-    worker.run()
-    # data = [
-    #     Transition(
-    #         np.random.normal(0.0, 0.5, size=(10,)),
-    #         np.random.normal(0.0, 0.5, size=(2,)),
-    #         0.7,
-    #         0.9,
-    #         np.random.normal(0.0, 0.5, size=(2,)),
-    #     )
-    #     for _ in range(10)
-    # ]
+    # policy = torch.ones_like(temp_policy).numpy().flatten()
+    policy = np.ones(temp_policy.nelement(), dtype=np.float32)
+    win_array = np.frombuffer(policy_window, dtype=np.float32)
+    # win_array[0] = 7.
+    print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, initial policy {policy}")
+    time.sleep(2)
+    policy_window.Lock(rank=0)
+    # window.Flush(rank=0)
+    policy_window.Get([policy, 2], target_rank=0)
+    # policy[:2] = win_array[:2]
+    policy_window.Unlock(rank=0)
+    print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, loaded policy {policy}")
 
-    # buff = np.arange(10)
-
-    # req = comm.Send_init(buff, dest=0, tag=11)
-    # req = comm.isend(buff, dest=0, tag=11)
-    # req.Start()
-
-    # print("I'm doing some other stuff")
-    # buff[0] = 100
-    # print(f"process {rank}/{size}: gathered data: {buff}")
-    # req.wait()
-
-# Gather data (Blocking operation)
-# data = comm.gather(data, root=0)
+    # worker = Worker(comm, 100, _BUFFER_GTHR_STATE, _POLICY_BCST_STATE)
+    # worker.run()
 
 if rank == 0:
-    learner = Learner(comm, 10000, _BUFFER_GTHR_STATE, _POLICY_BCST_STATE)
-    learner.learn()
-    # data = np.empty(10, dtype=np.int)
-    # req = comm.Recv_init(data, source=1, tag=11)
-    # req = comm.irecv(source=1, tag=11)
-    # time.sleep(10)
-    # req.Start()
-    # data = req.wait()
-    # print(type(data))
-    # print(f"process {rank}/{size}: gathered data: {data}")
+    policy = torch.ones_like(temp_policy).numpy().flatten() * 5.0
+    win_array = np.frombuffer(policy_window, dtype=np.float32)
+    print(f"worker: {comm.Get_rank()}/{comm.Get_size()}, initial policy {policy}")
+    policy_window.Lock(rank=0)
+    print(win_array)
+    policy_window.Put(policy, target_rank=0)
+    # win_array[:2] = policy[:2]
+    # window.Flush(rank=1)
+    # window.Sync()
+    print(win_array)
+    policy_window.Unlock(rank=0)
+
+    # learner = Learner(comm, 10000, _BUFFER_GTHR_STATE, _POLICY_BCST_STATE)
+    # learner.learn()
