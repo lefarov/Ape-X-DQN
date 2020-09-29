@@ -156,15 +156,23 @@ class Net(nn.Module):
 
 # %% Worker and learner classes
 class Worker(object):
-    def __init__(self, mpi_comm, buffer_size, model, model_window, n_steps=100):
+    def __init__(
+        self,
+        mpi_comm,
+        buffer_size,
+        model,
+        model_window,
+        transitions_window,
+        n_steps=100,
+    ):
         self.comm = mpi_comm
 
-        # Experiance buffer
+        # Local experiance buffer
         self.buffer = []
         self.size = buffer_size
 
-        self.step_n = n_steps
-        self.step_i = 0
+        # RMA window for transitions
+        self.trans_window = transitions_window
 
         # Model object and RMA window for model parameters
         self.model = model
@@ -188,6 +196,9 @@ class Worker(object):
 
         # Initialize empty request for sending rollouts
         self.req = MPI.Request()
+
+        self.step_n = n_steps
+        self.step_i = 0
 
     def run(self):
         # TODO: collect data while previous send is not completed.
@@ -327,10 +338,16 @@ trans = [
 trans_bsize = len(pickle.dumps(trans[0]))
 trans_window = MPI.Win.Allocate(trans_bsize * 2, comm=comm)
 
+counter_window = MPI.Win.Allocate(4, comm=comm)
+
 if rank != 0:
     if _TEST_SIGNLE_TRANSFER:
         read_model(model_window, net)
         write_transitions(trans_window, trans)
+
+        counter_window.Lock(rank=0)
+        counter_window.Put((10).to_bytes(4, byteorder="big"), target_rank=0)
+        counter_window.Unlock(rank=0)
 
     else:
         pass
@@ -341,6 +358,14 @@ if rank == 0:
     if _TEST_SIGNLE_TRANSFER:
         share_model(model_window, net)
         read_transitions(trans_window, trans, trans_bsize)
+
+        # Wait for 2 seconds
+        time.sleep(3)
+
+        # Read model state from the Learner's window
+        counter_window.Lock(rank=0)
+        print(int.from_bytes(counter_window, byteorder="big"))
+        counter_window.Unlock(rank=0)
 
     else:
         pass
