@@ -1,286 +1,339 @@
-#!/usr/bin/env python
+import abc
 import torch
-import torch.multiprocessing as mp
 import random
 import numpy as np
-from collections import namedtuple
-from duelling_network import DuellingDQN
-from env import make_local_env
+import typing as typ
+import torch.multiprocessing as mp
+
+from collections import namedtuple, deque
+from dataclasses import dataclass
+from mpi4py import MPI
+
+from ape_x_dqn.utilities import (
+    transition_buffer_to_bytes,
+    ndarray_to_model_state,
+    model_state_nelements,
+)
+
+# from ape_x_dqn.duelling_network import DuellingDQN
+# from ape_x_dqn.env import make_local_env
 
 # import cv2
 
-Transition = namedtuple("Transition", ["S", "A", "R", "Gamma", "q"])
-N_Step_Transition = namedtuple(
-    "N_Step_Transition",
-    ["S_t", "A_t", "R_ttpB", "Gamma_ttpB", "qS_t", "S_tpn", "qS_tpn", "key"],
+# Transition = namedtuple(
+#     "Transition",
+#     ["S", "A", "R", "Q", "S_next", "Q_next"],
+# )
+
+
+@dataclass
+class Transition:
+    S: typ.Any
+    A: typ.Any
+    R: float
+    Q: float
+    S_next: typ.Any
+    Q_next: float
+
+
+""" N Step Transition with accumulated discounted return
+
+S:          (Any):      state at time t
+A:          (int):      action at time t
+R_nstep:    (float):    cummulative discount reward after N time steps
+Q:          (flaot):    Q(S, A)
+S_nstep:    (Any):      state after N time steps
+Q_nstep:    (float):    max(a) Q(S_nstep, a)
+key:        (str):      unique identifier of transition for priority dictionary
+
+Q and Q_nstep are used only for theinitial priorities computation
+"""
+NStepTransition = namedtuple(
+    "NStepTransition",
+    ["S", "A", "R_nstep", "Q", "S_nstep", "Q_nstep", "key"],
 )
+
+# @dataclass
+# class NStepTransition:
+#     S: t.Any
+#     A: t.Any
+#     R_nstep: float
+#     Q: float
+#     S_nstep: t.Any
+#     Q_nstep: float
+#     key: str
 
 
 class ExperienceBuffer(object):
-    def __init__(self, n, actor_id):
-        """
-        Implements a circular/ring buffer to store n-step transition data used by the actor
-        :param n:
-        """
-        self.local_1step_buffer = (
-            list()
-        )  #  To store single step transitions to compose n-step transitions
-        self.local_nstep_buffer = (
-            list()
-        )  #  To store n-step transitions b4 they r batched, prioritized and sent to replay mem
-        self.idx = -1
-        self.capacity = n
-        self.gamma = 0.99
+    def __init__(self, nstep_buffer, nstep_capacity, n_steps, gamma, actor_id):
+        self.__nstep_buffer = nstep_buffer
+        self.nstep_capacity = nstep_capacity
+        self.nstep_idx = 0
+
+        # Local single step transition buffer
+        self.local_sstep_buffer = deque(maxlen=n_steps)
+
+        self.n_steps = n_steps
+        self.gamma = gamma
         self.id = actor_id
-        self.n_step_seq_num = 0  # Used to compose the unique key per per-actor and per n-step transition stored
 
-    def update_buffer(self):
-        """
-        Updates the accumulated per-step discount and the partial return for every item in the buffer. This should be
-        called after every new transition is added to the buffer
-        :return: None
-        """
-        for i in range(self.B - 1):
-            R = self.local_1step_buffer[i].R
-            Gamma = 1
-            for k in range(i + 1, self.B):
-                Gamma *= self.gamma
-                R += Gamma * self.local_1step_buffer[k].R
-            self.local_1step_buffer[i] = Transition(
-                self.local_1step_buffer[i].S,
-                self.local_1step_buffer[i].A,
-                R,
-                Gamma,
-                self.local_1step_buffer[i].q,
-            )
-
-    def construct_nstep_transition(self, data):
-        if (
-            self.idx == -1
-        ):  #  Episode ended at the very first step in this n-step transition
-            return
-        key = str(self.id) + str(self.n_step_seq_num)
-        n_step_transition = N_Step_Transition(
-            *self.local_1step_buffer[0], data.S, data.q, key
-        )
-        self.n_step_seq_num += 1
-        #  Put the n_step_transition into a local memory store
-        self.local_nstep_buffer.append(n_step_transition)
-        #  Free-up the buffer
-        self.local_1step_buffer.clear()
-        #  Reset the memory index
-        self.idx = -1
-
-    def add(self, data):
-        """
-        Add transition data to the Experience Buffer and calls update_buffer
-        :param data: tuple containing a transition data of type Transition(s, a, r, gamma, q)
-        :return: None
-        """
-        if self.idx + 1 < self.capacity:
-            self.idx += 1
-            self.local_1step_buffer.append(None)
-            self.local_1step_buffer[self.idx] = data
-            self.update_buffer()  #  calculate the accumulated per-step disc & partial return for all entries
-        else:  # single-step buffer has reached its capacity, n. Compute
-            #  Construct the n-step transition
-            self.construct_nstep_transition(data)
-
-    def get(self, batch_size):
-        assert (
-            batch_size <= self.size
-        ), "Requested n-step transitions batch size is more than available"
-        batch_of_n_step_transitions = self.local_nstep_buffer[:batch_size]
-        del self.local_nstep_buffer[:batch_size]
-        return batch_of_n_step_transitions
+        # Used to compute the unique n-step transition key
+        self.nstep_transition_num = 0
 
     @property
-    def B(self):
-        """
-        The current size of local single step buffer. B follows the same notation as in the Ape-X paper(TODO: insert link to paper)
-        :return: The current size of the buffer
-        """
-        return len(self.local_1step_buffer)
+    def nstep_buffer(self):
+        return self.__nstep_buffer
+
+    @property
+    def nstep_idx(self):
+        return self.__nstep_idx
+
+    @nstep_idx.setter
+    def nstep_idx(self, idx):
+        self.__nstep_idx = idx % self.nstep_capacity
 
     @property
     def size(self):
-        """
-        The current size of the local n-step experience memory
-        :return:
-        """
-        return len(self.local_nstep_buffer)
+        return len(self.local_sstep_buffer)
+
+    def aggregate_return(self):
+        for i, transition in enumerate(reversed(self.local_sstep_buffer)):
+            discount = self.gamma ** i if i > 0 else 0
+            transition.R += discount * self.local_sstep_buffer[-1].R
+
+    def add(self, transition: Transition, done: bool) -> None:
+        # Add transition to the local buffer of single transitions
+        self.local_sstep_buffer.append(transition)
+        # Agrreate the discounted rewards to the head of the local buffer
+        self.aggregate_return()
+
+        if self.size == self.n_steps or done:
+            # Construct the N step transitions
+            head = self.local_sstep_buffer.popleft()
+            self.nstep_buffer[self.nstep_idx] = NStepTransition(
+                head.S,
+                head.A,
+                head.R,
+                head.Q,
+                transition.S_next,
+                transition.Q_next,
+                f"{self.id}:{self.nstep_transition_num}",
+            )
+
+            self.nstep_idx += 1
+            self.nstep_transition_num += 1
+
+            if done:
+                # Clear the local buffer
+                self.local_sstep_buffer.clear()
 
 
-class Actor(mp.Process):
+class Worker(abc.ABC):
     def __init__(
-        self, actor_id, env_conf, shared_state, shared_replay_mem, actor_params
+        self,
+        q_net: torch.nn.Module,
+        policy: typ.Callable[[typ.Any, int], int],
+        env,
+        capacity,
+        gamma,
+        model_update_t=200,
+        transitions_nsteps=1,
+        transitions_send_t=200,
+        total_time_steps=1000,
     ):
-        super(Actor, self).__init__()
-        self.actor_id = actor_id  # Used to compose a unique key for the transitions generated by each actor
-        state_shape = tuple(env_conf["state_shape"])
-        action_dim = env_conf["action_dim"]
-        self.params = actor_params
-        self.shared_state = shared_state
-        self.T = self.params["T"]
-        self.Q = DuellingDQN(state_shape, action_dim)
-        self.Q.load_state_dict(shared_state["Q_state_dict"])
-        self.env = make_local_env(env_conf["name"])
-        self.policy = self.epsilon_greedy_Q
-        self.local_experience_buffer = ExperienceBuffer(
-            self.params["num_steps"], self.actor_id
+        self.id = 0
+        self.q_net = q_net
+        self.policy = policy
+        self.env = env
+        self.capacity
+
+        self.mutable_experience_buffer = [None] * self.capacity
+        self.nstep_experience = ExperienceBuffer(
+            self.mutable_experience_buffer,
+            capacity,
+            transitions_nsteps,
+            gamma,
+            self.id,
         )
-        self.global_replay_queue = shared_replay_mem
-        eps = self.params["epsilon"]
-        N = self.params["num_actors"]
-        alpha = self.params["alpha"]
-        self.epsilon = eps ** (1 + alpha * self.actor_id / (N - 1))
-        self.gamma = self.params["gamma"]
-        self.num_buffered_steps = 0  # Used to compose a unique key for the transitions generated by each actor
-        self.rgb2gray = lambda x: np.dot(
-            x, np.array([[0.299, 0.587, 0.114]]).T
-        )  # RGB to Gray scale
-        self.torch_shape = lambda x: np.reshape(
-            self.rgb2gray(x), (1, x.shape[1], x.shape[0])
-        )  # WxHxC to CxWxH
-        self.obs_preproc = lambda x: np.resize(self.torch_shape(x), state_shape)
 
-    def epsilon_greedy_Q(self, qS_t):
-        if random.random() >= self.epsilon:
-            return np.argmax(qS_t)
-        else:
-            return random.choice(list(range(len(qS_t))))
+        self.gamma = gamma
+        self.nsteps = transitions_nsteps
 
-    def compute_priorities(self, n_step_transitions):
-        n_step_transitions = N_Step_Transition(*zip(*n_step_transitions))
-        # Convert tuple to numpy array
-        rew_t_to_tpB = np.array(n_step_transitions.R_ttpB)
-        gamma_t_to_tpB = np.array(n_step_transitions.Gamma_ttpB)
-        qS_tpn = np.array(n_step_transitions.qS_tpn)
-        A_t = np.array(n_step_transitions.A_t, dtype=np.int)
-        qS_t = np.array(n_step_transitions.qS_t)
+        self.model_update_t = model_update_t
+        self.trans_send_t = transitions_send_t
+        self.total_t = total_time_steps
 
-        # print("np.max(qS_tpn,1):", np.max(qS_tpn, 1))
-        #  Calculate the absolute n-step TD errors
-        n_step_td_target = rew_t_to_tpB + gamma_t_to_tpB * np.max(qS_tpn, 1)
-        # print("td_target:", n_step_td_target)
-        n_step_td_error = n_step_td_target - np.array(
-            [qS_t[i, A_t[i]] for i in range(A_t.shape[0])]
-        )
-        # print("td_err:", n_step_td_error)
-        priorities = {
-            k: val for k in n_step_transitions.key for val in abs(n_step_td_error)
-        }
-        return priorities
+        # Get initial model parameters
+        self._update_model()
+
+    def compute_priorities(self, transitions: typ.List[NStepTransition]):
+        # Conver list of NStepTransitoins to the NStepTransitoin with the list members
+        n_step_transitions = NStepTransition(*zip(*transitions))
+
+        q = np.array(n_step_transitions.Q)
+        r_nstep = np.array(n_step_transitions.R_nstep)
+        q_nstep = np.array(n_step_transitions.Q_nstep)
+
+        # Compute TD error (no Double-Q)
+        target = r_nstep + (self.gamma ** self.nsteps) * q_nstep
+        td_error_nstep = abs(q - target)
+
+        return {k: v for k in n_step_transitions.key for v in td_error_nstep}
+
+    @torch.no_grad()
+    def get_q(self, obs):
+        return self.q_net(obs)
 
     def run(self):
-        """
-        A method to gather experiences using the Actor's policy and the Actor's environment instance.
-          - Periodically syncs the parameters of the Q network used by the Actor with the latest Q parameters made available by
-            the Learner process.
-          - Stores the single step transitions and the n-step transitions in a local experience buffer
-          - Periodically flushes the n-step transition experiences to the global replay queue
-        :param T: The total number of time steps to gather experience
-        :return:
-        """
-        # 3. Get initial state from environment
-        obs = self.obs_preproc(self.env.reset())
-        ep_reward = []
-        for t in range(self.T):
-            with torch.no_grad():
-                qS_t = (
-                    self.Q(torch.from_numpy(obs).unsqueeze(0).float())[2]
-                    .squeeze()
-                    .numpy()
-                )
-            # 5. Select the action using the current policy
-            action = self.policy(qS_t)
-            # 6. Apply action in the environment
-            next_obs, reward, done, _ = self.env.step(action)
-            # 7. Add data to local buffer
-            self.local_experience_buffer.add(
-                Transition(obs, action, reward, self.gamma, qS_t)
-            )
-            obs = self.obs_preproc(next_obs)
-            ep_reward.append(reward)
-            print(
-                "Actor#",
-                self.actor_id,
-                "t=",
-                t,
-                "action=",
-                action,
-                "reward:",
-                reward,
-                "1stp_buf_size:",
-                self.local_experience_buffer.B,
-                end="\r",
+        # Reset environment and compute initial Q values
+        obs = self.env.reset()
+        q_vals = self.get_q(obs)
+
+        for t in range(self.tsteps):
+            # Compute actrions from Q values
+            act = self.policy(q_vals, t)
+
+            # Step throught the environment and add transitiont to experience
+            obs_next, rew, done, info = self.env.step(act)
+            q_vals_next = self.get_q(obs_next)
+
+            self.nstep_experience.add(
+                Transition(
+                    obs, act, rew, q_vals[act], obs_next, torch.max(q_vals_next)
+                ),
+                done,
             )
 
-            if done:  # Not mentioned in the paper's algorithm
-                # Truncate the n-step transition as the episode has ended; NOTE: Reward is set to 0
-                self.local_experience_buffer.construct_nstep_transition(
-                    Transition(obs, action, 0, self.gamma, qS_t)
-                )
-                # Reset the environment
-                obs = self.obs_preproc(self.env.reset())
-                print(
-                    "Actor#:",
-                    self.actor_id,
-                    "t:",
-                    t,
-                    "  ep_len:",
-                    len(ep_reward),
-                    "  ep_reward:",
-                    np.sum(ep_reward),
-                )
-                ep_reward = []
+            # If done, reset the environment
+            if done:
+                obs_next = self.env.reset()
+                q_vals_next = self.get_q(obs_next)
 
-            # 8. Periodically send data to replay
-            if (
-                self.local_experience_buffer.size
-                >= self.params["n_step_transition_batch_size"]
-            ):
-                # 9. Get batches of multi-step transitions
-                n_step_experience_batch = self.local_experience_buffer.get(
-                    self.params["n_step_transition_batch_size"]
-                )
-                # 10.Calculate the priorities for experience
-                priorities = self.compute_priorities(n_step_experience_batch)
-                # 11. Send the experience to the global replay memory
-                self.global_replay_queue.put([priorities, n_step_experience_batch])
+            # Step forward
+            obs = obs_next
+            q_vals = q_vals_next
 
-            if t % self.params["Q_network_sync_freq"] == 0:
-                # 13. Obtain latest network parameters
-                self.Q.load_state_dict(self.shared_state["Q_state_dict"])
+            # Send transitions
+            if t % self.trans_send_t == 0 and t > 0:
+                self._send_transitions()
+
+            # Update model
+            if t % self.model_update_t == 0 and t > 0:
+                self._update_model()
+
+    @abc.abstractmethod
+    def _update_model(self):
+        pass
+
+    @abc.abstractmethod
+    def _send_transitions(self):
+        pass
 
 
-# class DummyActor(object):
-#     def __init__()
+class MPIWorker(Worker):
+    def __init__(
+        self,
+        mpi_comm,
+        model_window,
+        transition_bsize,
+        transitions_window,
+        transitions_idx_window,
+        capacity_total,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.blen_total = capacity_total * transition_bsize
+
+        self.model_window = model_window
+        self.model_state = self.q_net.state_dict()
+        self.model_array = np.zeros(
+            model_state_nelements(self.model_state), dtype=np.float32
+        )
+
+        self.trans_window = transitions_window
+        self.trans_idx_window = transitions_idx_window
+
+    def _send_transitions(self):
+        # Lock the RMA window for replay buffer on Learner process.
+        # Idx window is not locked explicitely, but it's accessed
+        # only within the replay window lock.
+        self.trans_window.Lock(rank=0)
+
+        # Read current index of total replay buffer
+        idx = int.from_bytes(self.trans_idx_window, byteorder="big")
+
+        # Pickle the transitions
+        # If N Step buffer is not complete yet
+        if self.mutable_experience_buffer[self.nstep_experience.nstep_idx] is None:
+            # Send dat till this index
+            barray = transition_buffer_to_bytes(
+                self.buffer[: self.nstep_experience.nstep_idx]
+            )
+        else:
+            # Send all data otherwise
+            barray = transition_buffer_to_bytes(self.buffer)
+
+        # If Learner Replay has enough space
+        if idx + len(barray) < self.blen_total:
+            # Write data in one block
+            self.trans_window.Put(
+                barray, target_rank=0, target=(idx, len(barray), MPI.BYTE)
+            )
+            # Increment the index
+            idx += len(barray)
+
+        else:
+            # Write data to the end of the buffer
+            n = self.blen_total % idx
+            self.trans_window.Put(
+                barray[:n],
+                target_rank=0,
+                target=(idx, n, MPI.BYTE),
+            )
+            # And to the beginning
+            self.trans_window.Put(
+                barray[n:],
+                target_rank=0,
+                target=(0, len(barray) - n, MPI.BYTE),
+            )
+            # Update the index
+            idx = len(barray) - n
+
+        # Write index back to the Learner RMA
+        self.idx_window.Put(idx.to_bytes(4, byteorder="big"), target_rank=0)
+
+        # Unlock the RMA window on Learner process
+        self.trans_window.Unlock(rank=0)
+
+    def _update_model(self):
+        # Lock the RMA window for model parameter on Learner process and read parameters
+        self.model_window.Lock(rank=0)
+        self.model_window.Get(self.model_array, target_rank=0)
+        self.model_window.Unlock(rank=0)
+
+        # Load received parameters to the model
+        self.model.load_state_dict(
+            ndarray_to_model_state(self.model_array, self.model_state)
+        )
 
 
-if __name__ == "__main__":
-    """
-    Simple standalone test routine for Actor class
-    """
-    env_conf = {"state_shape": (1, 84, 84), "action_dim": 4, "name": "Breakout-v0"}
-    params = {
-        "local_experience_buffer_capacity": 10,
-        "epsilon": 0.4,
-        "alpha": 7,
-        "gamma": 0.99,
-        "num_actors": 2,
-        "n_step_transition_batch_size": 5,
-        "Q_network_sync_freq": 10,
-        "num_steps": 3,
-    }
-    dummy_q = DuellingDQN(env_conf["state_shape"], env_conf["action_dim"])
-    mp_manager = mp.Manager()
-    shared_state = mp_manager.dict()
-    shared_state["Q_state_dict"] = dummy_q.state_dict()
-    shared_replay_mem = mp_manager.Queue()
-    actor = Actor(1, env_conf, shared_state, shared_replay_mem, params)
-    actor.gather_experience(101)
-    print("Main: replay_mem.size:", shared_replay_mem.qsize())
-    for i in range(shared_replay_mem.qsize()):
-        p, xp_batch = shared_replay_mem.get()
-        print("priority:", p)
+class TorchDistWorker(Worker, mp.Process):
+    def __init__(
+        self,
+        model_shared_state,
+        transitions_shared_mem,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.model_state = model_shared_state
+        self.trans_mem = transitions_shared_mem
+
+    def _send_transitions(self):
+        # Calculate the priorities for experience
+        priorities = self.compute_priorities(self.mutable_experience_buffer)
+        # Send the experience to the global replay memory
+        self.trans_mem.put([priorities, self.mutable_experience_buffer])
+
+    def _update_model(self):
+        self.q_net.load_state_dict(self.model_state["q_state_dict"])
