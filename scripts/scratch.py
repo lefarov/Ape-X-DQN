@@ -1,3 +1,10 @@
+""" Scratch script for OpenMPI testing
+
+This script is intended to test possible MPI communication
+modes betwean Worker and Learner. It will be neither tested
+nor documented.
+"""
+
 # %% Imports
 import time
 import random
